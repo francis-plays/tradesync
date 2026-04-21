@@ -292,3 +292,4 @@ async def execute_trade(signal_id: str, signal_data: dict, channel_id: str):
 
         from src.bot.notification_bot import send_system_alert
         await send_system_alert(f"Trade execution failed for signal {signal_id}:\n{e}")
+        
