@@ -17,12 +17,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# cTrader imports at module level (required by Python)
+try:
+    from ctrader_open_api import Client, Protobuf, TcpProtocol
+    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import *
+    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
+    CTRADER_AVAILABLE = True
+except ImportError:
+    CTRADER_AVAILABLE = False
+    print("⚠️  ctrader-open-api not installed — paper mode only")
+
 from src.state.database import (
     save_position, update_signal_status,
     log_event, get_setting
 )
 
-# ─── MODE CONFIG (change this one line to go live) ───────────────────────────
+# ─── MODE CONFIG (flip to False once cTrader app is Active) ──────────────────
 PAPER_MODE = True
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,7 +43,7 @@ ACCOUNT_ID    = int(os.getenv('CTRADER_ACCOUNT_ID'))
 HOST          = os.getenv('CTRADER_HOST', 'demo.ctraderapi.com')
 PORT          = int(os.getenv('CTRADER_PORT', 5035))
 
-# Pip values per lot for common pairs (USD account)
+# Pip values per lot (USD account)
 PIP_VALUES = {
     'EURUSD': 10.0, 'GBPUSD': 10.0, 'AUDUSD': 10.0,
     'NZDUSD': 10.0, 'USDCAD': 10.0, 'USDCHF': 10.0,
@@ -41,7 +52,7 @@ PIP_VALUES = {
     'SPX500': 10.0, 'USOIL':  10.0, 'BTCUSD': 10.0,
 }
 
-# Pip size per pair (how much price moves per pip)
+# How much price moves per pip
 PIP_SIZES = {
     'USDJPY': 0.01, 'GBPJPY': 0.01, 'EURJPY': 0.01,
     'XAUUSD': 0.1,  'BTCUSD': 1.0,  'NAS100': 1.0,
@@ -57,7 +68,7 @@ def calculate_lot_size(account_balance: float, risk_percent: float,
                        sl_price: float, entry_price: float, pair: str) -> float:
     """
     lot_size = (balance × risk%) / (sl_pips × pip_value_per_lot)
-    Minimum lot size: 0.01
+    Minimum: 0.01 lots
     """
     pip_size    = get_pip_size(pair)
     sl_pips     = abs(entry_price - sl_price) / pip_size
@@ -71,27 +82,31 @@ def calculate_lot_size(account_balance: float, risk_percent: float,
     return max(round(lot_size, 2), 0.01)
 
 
-# ── Paper mode execution ─────────────────────────────────────────────────────
+# ── Paper mode ───────────────────────────────────────────────────────────────
 
 async def execute_paper_trade(signal_id: str, signal_data: dict,
                                channel_id: str, lot_size: float,
                                account_balance: float, risk_percent: float):
-    """Simulate trade execution — no real orders placed."""
+    """Simulate trade — no real orders placed."""
 
-    pair      = signal_data.get('pair')
-    direction = signal_data.get('direction')
-    sl        = signal_data.get('sl')
-    tp_raw    = signal_data.get('tp', [])
-    tp        = tp_raw if isinstance(tp_raw, list) else json.loads(tp_raw or '[]')
-    tp_display= ', '.join(str(t) for t in tp) if tp else 'N/A'
-    risk_usd  = round(account_balance * risk_percent, 2)
-    fake_pos  = f"PAPER-{signal_id}"
+    pair       = signal_data.get('pair')
+    direction  = signal_data.get('direction')
+    sl         = signal_data.get('sl')
+    tp_raw     = signal_data.get('tp', [])
+    if isinstance(tp_raw, list):
+        tp = tp_raw
+    elif isinstance(tp_raw, (int, float)):
+        tp = [str(tp_raw)]
+    elif isinstance(tp_raw, str):
+        tp = json.loads(tp_raw) if tp_raw else []
+    else:
+        tp = []
+    tp_display = ', '.join(str(t) for t in tp) if tp else 'N/A'
+    risk_usd   = round(account_balance * risk_percent, 2)
+    fake_pos   = f"PAPER-{signal_id}"
 
-    print(f"   📝 PAPER MODE — Simulating: {direction} {pair}")
-    print(f"   📝 Lot size: {lot_size} | SL: {sl} | TP: {tp_display}")
-    print(f"   📝 Risk: ${risk_usd} ({int(risk_percent*100)}%)")
+    print(f"   📝 PAPER MODE — {direction} {pair} | Lots: {lot_size} | SL: {sl} | TP: {tp_display}")
 
-    # Save to state store as paper position
     save_position(
         signal_id=signal_id,
         channel_id=channel_id,
@@ -107,7 +122,6 @@ async def execute_paper_trade(signal_id: str, signal_data: dict,
     log_event('paper_trade', f"{direction} {pair} {lot_size} lots — paper mode",
               signal_id=signal_id, channel_id=channel_id)
 
-    # Notify Francis via bot
     from src.bot.notification_bot import send_message
     await send_message(
         f"📝 <b>PAPER TRADE</b>\n"
@@ -124,22 +138,29 @@ async def execute_paper_trade(signal_id: str, signal_data: dict,
     )
 
 
-# ── Live cTrader execution ───────────────────────────────────────────────────
+# ── Live cTrader execution ────────────────────────────────────────────────────
 
 async def execute_live_trade(signal_id: str, signal_data: dict,
                               channel_id: str, lot_size: float,
                               account_balance: float, risk_percent: float):
     """Place a real order via cTrader Open API."""
-    from ctrader_open_api import Client, Protobuf, TcpProtocol
-    from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
-    from ctrader_open_api.messages.OpenApiMessages_pb2 import *
-    from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
+
+    if not CTRADER_AVAILABLE:
+        print("   ❌ ctrader-open-api not available — cannot execute live trade")
+        return
 
     pair      = signal_data.get('pair')
     direction = signal_data.get('direction')
     sl        = float(signal_data.get('sl'))
     tp_raw    = signal_data.get('tp', [])
-    tp        = tp_raw if isinstance(tp_raw, list) else json.loads(tp_raw or '[]')
+    if isinstance(tp_raw, list):
+        tp = tp_raw
+    elif isinstance(tp_raw, (int, float)):
+        tp = [str(tp_raw)]
+    elif isinstance(tp_raw, str):
+        tp = json.loads(tp_raw) if tp_raw else []
+    else:
+        tp = []
 
     loop              = asyncio.get_event_loop()
     authorized_future = loop.create_future()
@@ -164,8 +185,7 @@ async def execute_live_trade(signal_id: str, signal_data: dict,
         elif msg_type == ProtoOAAccountAuthRes().payloadType:
             if not authorized_future.done():
                 authorized_future.set_result(True)
-
-            # Place order immediately after auth
+            # Place order
             order = ProtoOANewOrderReq()
             order.ctidTraderAccountId = ACCOUNT_ID
             order.symbolName          = pair
@@ -231,28 +251,24 @@ async def execute_live_trade(signal_id: str, signal_data: dict,
         client_obj.stopService()
 
 
-# ── Main entry point ─────────────────────────────────────────────────────────
+# ── Main entry point ──────────────────────────────────────────────────────────
 
 async def execute_trade(signal_id: str, signal_data: dict, channel_id: str):
-    """
-    Route to paper or live execution based on PAPER_MODE flag.
-    Calculates lot size before routing.
-    """
+    """Route to paper or live execution based on PAPER_MODE."""
+
     pair         = signal_data.get('pair')
     direction    = signal_data.get('direction')
     sl           = signal_data.get('sl')
     entry        = signal_data.get('entry')
     risk_percent = float(get_setting('risk_percent') or 0.02)
 
-    # Estimate entry if not provided
     pip_size    = get_pip_size(pair)
     entry_price = float(entry) if entry else (
         float(sl) + (20 * pip_size) if direction == 'BUY'
         else float(sl) - (20 * pip_size)
     )
 
-    # Use fixed balance in paper mode
-    account_balance = 10000.0
+    account_balance = 10000.0  # Updated from live account when PAPER_MODE = False
 
     lot_size = calculate_lot_size(
         account_balance=account_balance,
@@ -262,8 +278,7 @@ async def execute_trade(signal_id: str, signal_data: dict, channel_id: str):
         pair=pair
     )
 
-    print(f"\n   {'📝' if PAPER_MODE else '📈'} {'Paper' if PAPER_MODE else 'Live'} execution: {direction} {pair}")
-    print(f"   Lot size: {lot_size} | Risk: {risk_percent*100}%")
+    print(f"\n   {'📝' if PAPER_MODE else '📈'} {'Paper' if PAPER_MODE else 'Live'}: {direction} {pair} | Lots: {lot_size}")
 
     try:
         if PAPER_MODE:
@@ -292,4 +307,3 @@ async def execute_trade(signal_id: str, signal_data: dict, channel_id: str):
 
         from src.bot.notification_bot import send_system_alert
         await send_system_alert(f"Trade execution failed for signal {signal_id}:\n{e}")
-        
